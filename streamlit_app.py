@@ -10,10 +10,6 @@ st.set_page_config(
 )
 
 
-# --------------------------------------------------
-# SUPABASE CONNECTION
-# --------------------------------------------------
-
 def make_client(url: str, key: str) -> Client:
     return create_client(url, key)
 
@@ -22,26 +18,30 @@ def get_client() -> Client:
     url = st.secrets.get("SUPABASE_URL", "")
     key = st.secrets.get("SUPABASE_PUBLISHABLE_KEY", "")
 
-    if not url or not key:
+    if (
+        not url
+        or not key
+        or "YOUR_PROJECT_REF" in url
+        or "REPLACE_ME" in key
+    ):
         st.error(
             "Supabase is not configured. Add SUPABASE_URL and "
-            "SUPABASE_PUBLISHABLE_KEY to .streamlit/secrets.toml."
+            "SUPABASE_PUBLISHABLE_KEY in Streamlit secrets."
         )
         st.stop()
 
     return make_client(url, key)
 
 
-def set_authenticated_session(client, session):
+def set_authenticated_session(client: Client, session) -> None:
     st.session_state["access_token"] = session.access_token
     st.session_state["refresh_token"] = session.refresh_token
     st.session_state["user_id"] = session.user.id
     st.session_state["client"] = client
 
 
-def active_client():
+def active_client() -> Client:
     client = get_client()
-
     access = st.session_state.get("access_token")
     refresh = st.session_state.get("refresh_token")
 
@@ -64,7 +64,7 @@ def active_client():
     return client
 
 
-def sign_out():
+def sign_out() -> None:
     try:
         client = st.session_state.get("client")
         if client:
@@ -87,190 +87,129 @@ def sign_out():
     st.rerun()
 
 
-# --------------------------------------------------
-# LOGIN AND REGISTRATION
-# --------------------------------------------------
+def login_ui(client: Client) -> None:
+    st.markdown("<div class='snap-auth-brand'>✦ SnapClass</div>", unsafe_allow_html=True)
+    st.title("Welcome to SnapClass")
+    st.caption("Sign in to continue to your attendance workspace, or create a new account.")
+    if st.button("← Back to home", key="back_to_home"):
+        st.session_state["snap_page"] = "home"
+        st.rerun()
 
-def login_ui(client):
-    st.title("🎓 SnapClass")
-    st.caption("Cloud student attendance — demo starter")
-
-    login_tab, signup_tab = st.tabs(
-        ["Sign in", "Create account"]
-    )
+    login_tab, signup_tab = st.tabs(["Sign in", "Create account"])
 
     with login_tab:
         with st.form("login"):
             email = st.text_input("Email")
-            password = st.text_input(
-                "Password",
-                type="password",
-            )
-
+            password = st.text_input("Password", type="password")
             submitted = st.form_submit_button(
-                "Sign in",
-                type="primary",
-                use_container_width=True,
+                "Sign in", type="primary", use_container_width=True
             )
 
         if submitted:
             try:
                 response = client.auth.sign_in_with_password(
-                    {
-                        "email": email.strip(),
-                        "password": password,
-                    }
+                    {"email": email.strip(), "password": password}
                 )
-
                 if not response.session:
                     st.error(
-                        "Sign-in did not return a session. "
-                        "Check whether email confirmation is required."
+                        "Sign-in did not return a session. Check whether "
+                        "email confirmation is required."
                     )
                 else:
-                    set_authenticated_session(
-                        client,
-                        response.session,
-                    )
+                    set_authenticated_session(client, response.session)
                     st.session_state["email"] = email.strip()
                     st.rerun()
-
             except Exception as e:
-                st.error(
-                    f"Sign-in failed: {type(e).__name__}: {e}"
-                )
+                st.error(f"Sign-in failed: {type(e).__name__}: {e}")
 
     with signup_tab:
         with st.form("signup"):
             name = st.text_input("Full name")
-
-            email = st.text_input(
-                "Email address",
-                key="signup_email",
-            )
-
+            email = st.text_input("Email address", key="signup_email")
             password = st.text_input(
                 "Password (at least 8 characters)",
                 type="password",
                 key="signup_password",
             )
-
-            role = st.selectbox(
-                "I am a",
-                ["Student", "Teacher"],
-            )
-
+            role = st.selectbox("I am a", ["Student", "Teacher"])
             submitted = st.form_submit_button(
-                "Create account",
-                type="primary",
-                use_container_width=True,
+                "Create account", type="primary", use_container_width=True
             )
 
         if submitted:
-            if (
-                not name.strip()
-                or not email.strip()
-                or len(password) < 8
-            ):
+            if not name.strip() or not email.strip() or len(password) < 8:
                 st.warning(
-                    "Enter your name, email, and a password "
-                    "of at least 8 characters."
+                    "Enter your name, email, and a password of at least "
+                    "8 characters."
                 )
                 return
 
             try:
                 response = client.auth.sign_up(
-                    {
-                        "email": email.strip(),
-                        "password": password,
-                    }
+                    {"email": email.strip(), "password": password}
                 )
-
                 user = getattr(response, "user", None)
                 session = getattr(response, "session", None)
 
                 if not user:
-                    st.error(
-                        "Supabase did not return a user."
-                    )
+                    st.error("Supabase did not return a user for this signup.")
                     return
 
+                # Supabase may require email confirmation before a session
+                # exists. In that case, the profile must be created after
+                # the user signs in, not with an unauthenticated request.
                 if not session:
                     st.success(
-                        "Account created. Verify your email if "
-                        "required, then sign in. If the profile "
-                        "was not created, check the database setup."
+                        "Account created. Verify your email if prompted, "
+                        "then sign in. If no profile is created automatically, "
+                        "sign in and use the matching account/profile setup."
                     )
                     return
 
                 set_authenticated_session(client, session)
-
+                authed = client
                 uid = user.id
 
                 if role == "Teacher":
-                    result = (
-                        client.table("teachers")
-                        .insert(
-                            {
-                                "username": email.strip(),
-                                "password": None,
-                                "name": name.strip(),
-                                "auth_user_id": uid,
-                            }
-                        )
-                        .execute()
-                    )
-
+                    result = authed.table("teachers").insert(
+                        {
+                            "username": email.strip(),
+                            "password": None,
+                            "name": name.strip(),
+                            "auth_user_id": uid,
+                        }
+                    ).execute()
                     st.session_state["role"] = "Teacher"
-                    st.session_state["profile_id"] = (
-                        result.data[0]["teacher_id"]
-                    )
-
+                    st.session_state["profile_id"] = result.data[0]["teacher_id"]
                 else:
-                    result = (
-                        client.table("students")
-                        .insert(
-                            {
-                                "name": name.strip(),
-                                "email": email.strip(),
-                                "auth_user_id": uid,
-                            }
-                        )
-                        .execute()
-                    )
-
+                    result = authed.table("students").insert(
+                        {
+                            "name": name.strip(),
+                            "email": email.strip(),
+                            "auth_user_id": uid,
+                        }
+                    ).execute()
                     st.session_state["role"] = "Student"
-                    st.session_state["profile_id"] = (
-                        result.data[0]["student_id"]
-                    )
+                    st.session_state["profile_id"] = result.data[0]["student_id"]
 
                 st.session_state["email"] = email.strip()
                 st.session_state["display_name"] = name.strip()
-
                 st.rerun()
 
             except Exception as e:
-                st.error(
-                    f"Account creation failed: {type(e).__name__}: {e}"
-                )
+                st.error(f"Account creation failed: {type(e).__name__}: {e}")
 
 
-# --------------------------------------------------
-# FIND THE SIGNED-IN USER'S PROFILE
-# --------------------------------------------------
-
-def recover_profile(client):
+def recover_profile(client: Client) -> bool:
+    """Find the app profile for the signed-in Supabase Auth user."""
     uid = st.session_state.get("user_id")
-
     if not uid:
         return False
 
-    profiles = [
+    for role, table, id_column in [
         ("Teacher", "teachers", "teacher_id"),
         ("Student", "students", "student_id"),
-    ]
-
-    for role, table, id_column in profiles:
+    ]:
         try:
             result = (
                 client.table(table)
@@ -282,68 +221,40 @@ def recover_profile(client):
 
             if result.data:
                 profile = result.data[0]
-
                 st.session_state["role"] = role
-                st.session_state["profile_id"] = (
-                    profile[id_column]
-                )
-
-                st.session_state["display_name"] = (
-                    profile.get("name", "")
-                )
-
+                st.session_state["profile_id"] = profile[id_column]
+                st.session_state["display_name"] = profile.get("name", "")
                 st.session_state["email"] = (
                     profile.get("email")
-                    or st.session_state.get("email", "")
+                    or st.session_state.get("email")
+                    or ""
                 )
-
                 return True
-
         except Exception:
+            # Continue to the other profile table. If neither profile can be
+            # read, main() displays a helpful sign-out/recovery message.
             continue
 
     return False
 
 
-# --------------------------------------------------
-# TEACHER DASHBOARD
-# --------------------------------------------------
-
-def teacher_dashboard(client):
+def teacher_dashboard(client: Client) -> None:
     st.title("Teacher dashboard")
-
-    st.write(
-        "Create a subject, then record attendance "
-        "for enrolled students."
-    )
+    st.write("Create a subject, then record attendance for enrolled students.")
 
     with st.expander("Create subject", expanded=True):
         with st.form("create_subject"):
             subject_name = st.text_input("Subject name")
-
             subject_code = st.text_input(
                 "Unique subject code",
                 help="Choose a short code students can enter.",
             )
-
-            section = st.text_input(
-                "Section / class",
-                value="A",
-            )
-
-            create = st.form_submit_button(
-                "Create subject",
-                type="primary",
-            )
+            section = st.text_input("Section / class", value="A")
+            create = st.form_submit_button("Create subject", type="primary")
 
         if create:
-            if (
-                not subject_name.strip()
-                or not subject_code.strip()
-                or not section.strip()
-            ):
+            if not subject_name.strip() or not subject_code.strip() or not section.strip():
                 st.warning("Complete all fields.")
-
             else:
                 try:
                     (
@@ -351,44 +262,29 @@ def teacher_dashboard(client):
                         .insert(
                             {
                                 "name": subject_name.strip(),
-                                "subject_code": (
-                                    subject_code.strip().upper()
-                                ),
+                                "subject_code": subject_code.strip().upper(),
                                 "section": section.strip(),
-                                "teacher_id": (
-                                    st.session_state["profile_id"]
-                                ),
+                                "teacher_id": st.session_state["profile_id"],
                             }
                         )
                         .execute()
                     )
-
                     st.success("Subject created.")
                     st.rerun()
-
                 except Exception as e:
-                    st.error(
-                        f"Could not create subject: "
-                        f"{type(e).__name__}: {e}"
-                    )
+                    st.error(f"Could not create subject: {type(e).__name__}: {e}")
 
     try:
         subjects = (
             client.table("subjects")
             .select("*")
-            .eq(
-                "teacher_id",
-                st.session_state["profile_id"],
-            )
+            .eq("teacher_id", st.session_state["profile_id"])
             .order("subject_id", desc=True)
             .execute()
             .data
         )
-
     except Exception as e:
-        st.error(
-            f"Could not load subjects: {type(e).__name__}: {e}"
-        )
+        st.error(f"Could not load your subjects: {type(e).__name__}: {e}")
         return
 
     if not subjects:
@@ -396,22 +292,14 @@ def teacher_dashboard(client):
         return
 
     subject_map = {
-        (
-            f'{s["name"]} — {s["section"]} '
-            f'({s["subject_code"]})'
-        ): s
-        for s in subjects
+        f'{subject["name"]} — {subject["section"]} ({subject["subject_code"]})':
+        subject
+        for subject in subjects
     }
-
-    selected_label = st.selectbox(
-        "Choose a subject",
-        list(subject_map.keys()),
-    )
-
+    selected_label = st.selectbox("Choose a subject", list(subject_map))
     subject = subject_map[selected_label]
 
     st.subheader("Enrolled students")
-
     try:
         enrollments = (
             client.table("subject_students")
@@ -420,28 +308,19 @@ def teacher_dashboard(client):
             .execute()
             .data
         )
+        student_ids = [row["student_id"] for row in enrollments]
 
-        student_ids = [
-            row["student_id"]
-            for row in enrollments
-        ]
-
-        if student_ids:
-            students = (
-                client.table("students")
-                .select("student_id,name,email")
-                .in_("student_id", student_ids)
-                .execute()
-                .data
-            )
-        else:
-            students = []
-
-    except Exception as e:
-        st.error(
-            f"Could not load enrolled students: "
-            f"{type(e).__name__}: {e}"
+        students = (
+            client.table("students")
+            .select("student_id,name,email")
+            .in_("student_id", student_ids)
+            .execute()
+            .data
+            if student_ids
+            else []
         )
+    except Exception as e:
+        st.error(f"Could not load enrolled students: {type(e).__name__}: {e}")
         return
 
     if not students:
@@ -450,95 +329,56 @@ def teacher_dashboard(client):
 
     with st.form("record_attendance"):
         st.caption(
-            "Check the students who are present. "
-            "Unchecked students will be recorded absent."
+            "Check the students who are present. Unchecked students will "
+            "be recorded absent."
         )
-
         present_ids = []
 
         for student in students:
-            checked = st.checkbox(
-                (
-                    f'{student["name"]} '
-                    f'({student.get("email") or "no email"})'
-                ),
-                key=(
-                    f'present_{subject["subject_id"]}_'
-                    f'{student["student_id"]}'
-                ),
-            )
-
-            if checked:
+            if st.checkbox(
+                f'{student["name"]} ({student.get("email") or "no email"})',
+                key=f'present_{subject["subject_id"]}_{student["student_id"]}',
+            ):
                 present_ids.append(student["student_id"])
 
-        save = st.form_submit_button(
-            "Save attendance",
-            type="primary",
-        )
+        save = st.form_submit_button("Save attendance", type="primary")
 
     if save:
-        timestamp = (
-            datetime.now(timezone.utc)
-            .replace(microsecond=0)
-            .isoformat()
-        )
-
+        timestamp = datetime.now(timezone.utc).replace(microsecond=0).isoformat()
         rows = [
             {
                 "student_id": student["student_id"],
                 "subject_id": subject["subject_id"],
                 "timestamp": timestamp,
-                "is_present": (
-                    student["student_id"] in present_ids
-                ),
+                "is_present": student["student_id"] in present_ids,
             }
             for student in students
         ]
 
         try:
-            (
-                client.table("attendance_logs")
-                .insert(rows)
-                .execute()
-            )
-
-            st.success(
-                f"Attendance saved for {len(rows)} students."
-            )
-
+            client.table("attendance_logs").insert(rows).execute()
+            st.success(f"Attendance saved for {len(rows)} students.")
         except Exception as e:
             st.error(
-                f"Attendance could not be saved: "
-                f"{type(e).__name__}: {e}"
+                f"Attendance could not be saved: {type(e).__name__}: {e}"
             )
 
 
-# --------------------------------------------------
-# STUDENT DASHBOARD
-# --------------------------------------------------
-
-def student_dashboard(client):
+def student_dashboard(client: Client) -> None:
     st.title("Student dashboard")
 
     with st.form("join_subject"):
         code = st.text_input("Subject code").strip().upper()
-
-        join = st.form_submit_button(
-            "Join subject",
-            type="primary",
-        )
+        join = st.form_submit_button("Join subject", type="primary")
 
     if join:
         if not code:
             st.warning("Enter a subject code.")
-
         else:
             try:
                 matches = (
                     client.table("subjects")
-                    .select(
-                        "subject_id,name,subject_code,section"
-                    )
+                    .select("subject_id,name,subject_code,section")
                     .eq("subject_code", code)
                     .limit(1)
                     .execute()
@@ -547,64 +387,43 @@ def student_dashboard(client):
 
                 if not matches:
                     st.warning("No subject found with that code.")
-
                 else:
                     subject = matches[0]
-                    student_id = st.session_state["profile_id"]
-
+                    # Avoid a confusing duplicate-enrollment error.
                     existing = (
                         client.table("subject_students")
                         .select("student_id")
-                        .eq("student_id", student_id)
-                        .eq(
-                            "subject_id",
-                            subject["subject_id"],
-                        )
+                        .eq("student_id", st.session_state["profile_id"])
+                        .eq("subject_id", subject["subject_id"])
                         .limit(1)
                         .execute()
                         .data
                     )
 
                     if existing:
-                        st.info(
-                            f'You have already joined {subject["name"]}.'
-                        )
-
+                        st.info(f'You have already joined {subject["name"]}.')
                     else:
                         (
                             client.table("subject_students")
                             .insert(
                                 {
-                                    "student_id": student_id,
+                                    "student_id": st.session_state["profile_id"],
                                     "subject_id": subject["subject_id"],
                                 }
                             )
                             .execute()
                         )
-
-                        st.success(
-                            f'Joined {subject["name"]}.'
-                        )
+                        st.success(f'Joined {subject["name"]}.')
                         st.rerun()
-
             except Exception as e:
-                st.error(
-                    f"Could not join subject: "
-                    f"{type(e).__name__}: {e}"
-                )
+                st.error(f"Could not join subject: {type(e).__name__}: {e}")
 
     st.subheader("My attendance")
 
-    # IMPORTANT:
-    # profile_id must be students.student_id,
-    # not the Supabase Auth UUID.
+    # profile_id must be the integer students.student_id, not auth_user_id.
     student_id = st.session_state.get("profile_id")
-
     if student_id is None:
-        st.error(
-            "Student profile ID is missing. "
-            "Sign out and sign in again."
-        )
+        st.error("Your student profile ID is missing. Sign out and sign in again.")
         return
 
     try:
@@ -619,17 +438,14 @@ def student_dashboard(client):
 
         if not rows:
             st.info(
-                "No attendance records were returned for your profile. "
-                "If your teacher has marked attendance, verify the "
-                "student_id and the attendance_logs SELECT policy "
-                "in Supabase."
+                "No attendance records were returned for your student profile. "
+                "If a teacher has marked attendance, check the attendance_logs "
+                "SELECT policy and confirm that your student_id matches the "
+                "record in Supabase."
             )
             return
 
-        subject_ids = list(
-            {row["subject_id"] for row in rows}
-        )
-
+        subject_ids = sorted({row["subject_id"] for row in rows})
         subjects = (
             client.table("subjects")
             .select("subject_id,name,subject_code")
@@ -637,43 +453,23 @@ def student_dashboard(client):
             .execute()
             .data
         )
-
         subject_names = {
-            subject["subject_id"]: (
-                f'{subject["name"]} '
-                f'({subject["subject_code"]})'
-            )
+            subject["subject_id"]:
+            f'{subject["name"]} ({subject["subject_code"]})'
             for subject in subjects
         }
 
         df = pd.DataFrame(rows)
-
-        df["subject"] = (
-            df["subject_id"]
-            .map(subject_names)
-            .fillna(
-                df["subject_id"].map(
-                    lambda value: f"Subject {value}"
-                )
-            )
+        df["subject"] = df["subject_id"].map(subject_names).fillna(
+            df["subject_id"].map(lambda value: f"Subject {value}")
         )
-
-        df["status"] = (
-            df["is_present"]
-            .map(
-                {
-                    True: "Present",
-                    False: "Absent",
-                }
-            )
-            .fillna("Unknown")
-        )
-
+        df["status"] = df["is_present"].map(
+            {True: "Present", False: "Absent"}
+        ).fillna("Unknown")
         df["timestamp"] = pd.to_datetime(
-            df["timestamp"],
-            errors="coerce",
-            utc=True,
-        ).dt.strftime("%Y-%m-%d %H:%M:%S UTC")
+            df["timestamp"], errors="coerce", utc=True
+        )
+        df["timestamp"] = df["timestamp"].dt.strftime("%Y-%m-%d %H:%M:%S UTC")
 
         st.dataframe(
             df[["subject", "timestamp", "status"]],
@@ -682,21 +478,10 @@ def student_dashboard(client):
         )
 
         total = len(rows)
-
-        present = sum(
-            row.get("is_present") is True
-            for row in rows
-        )
-
-        attendance_rate = (
-            f"{present / total:.0%}"
-            if total
-            else "—"
-        )
-
+        present = sum(row.get("is_present") is True for row in rows)
         st.metric(
             "Attendance rate",
-            attendance_rate,
+            f"{present / total:.0%}" if total else "—",
         )
 
     except Exception as e:
@@ -704,56 +489,110 @@ def student_dashboard(client):
             "Could not load attendance from Supabase. "
             f"Error: {type(e).__name__}: {e}"
         )
-
         st.caption(
-            "If the error mentions permission denied, inspect "
-            "the SELECT RLS policies on attendance_logs and subjects. "
-            "Do not disable RLS or use a service-role key."
+            "If the error mentions permission denied, inspect the SELECT "
+            "RLS policies on attendance_logs and subjects. Do not disable RLS "
+            "or use a service-role key in the app."
         )
 
 
-# --------------------------------------------------
-# MAIN APPLICATION
-# --------------------------------------------------
+def landing_page() -> None:
+    """Public marketing landing page; auth and dashboards remain unchanged."""
+    st.markdown(r"""
+    <style>
+      .stApp { background: #f6f8fc; }
+      [data-testid="stHeader"] { background: rgba(246,248,252,.88); }
+      .block-container { max-width: 1180px; padding-top: 1.5rem; padding-bottom: 3rem; }
+      .snap-nav { display:flex; align-items:center; justify-content:space-between; padding: .35rem 0 1.8rem; }
+      .snap-brand { font-size:1.35rem; font-weight:800; letter-spacing:-.04em; color:#14213d; }
+      .snap-brand span { color:#4f46e5; }
+      .snap-pill { display:inline-block; border:1px solid #dbe3f0; border-radius:999px; padding:.42rem .8rem; color:#394766; font-size:.82rem; background:#fff; }
+      .snap-hero { background:linear-gradient(135deg,#111b3a 0%,#263b75 58%,#4f46e5 100%); border-radius:28px; padding:3.4rem 3rem; color:white; box-shadow:0 22px 55px rgba(31,45,91,.17); }
+      .snap-eyebrow { color:#c7d2fe; text-transform:uppercase; letter-spacing:.16em; font-size:.75rem; font-weight:800; }
+      .snap-hero h1 { color:#fff; font-size:clamp(2.4rem,5vw,4.3rem); line-height:1.04; letter-spacing:-.055em; margin:.8rem 0 1rem; }
+      .snap-hero p { color:#e0e7ff; font-size:1.08rem; line-height:1.75; max-width:650px; }
+      .snap-hero-card { border:1px solid rgba(255,255,255,.2); background:rgba(255,255,255,.09); border-radius:20px; padding:1.25rem; margin-top:1rem; }
+      .snap-stat { color:white; font-size:1.65rem; font-weight:800; }
+      .snap-muted { color:#dbe4ff; font-size:.85rem; }
+      .snap-section { padding:3rem 0 .6rem; }
+      .snap-section h2 { color:#15213d; font-size:2rem; letter-spacing:-.04em; }
+      .snap-section p { color:#64708a; line-height:1.7; }
+      .snap-feature { background:white; border:1px solid #e6eaf2; border-radius:18px; padding:1.25rem; min-height:170px; box-shadow:0 7px 22px rgba(26,40,74,.035); }
+      .snap-feature-icon { font-size:1.5rem; }
+      .snap-feature h3 { color:#17233e; font-size:1.08rem; margin:.7rem 0 .35rem; }
+      .snap-feature p { font-size:.93rem; margin:0; }
+      .snap-step { border-left:3px solid #818cf8; padding:.2rem 0 .2rem 1rem; margin:.65rem 0; }
+      .snap-step strong { color:#17233e; }
+      .snap-auth-brand { font-size:1.25rem; font-weight:800; color:#4f46e5; }
+      .snap-footer { border-top:1px solid #e1e7f0; padding-top:1.3rem; margin-top:3rem; color:#77829a; font-size:.85rem; }
+      @media(max-width:700px) { .snap-hero {padding:2rem 1.3rem;border-radius:20px;} }
+    </style>
+    <div class="snap-nav"><div class="snap-brand">✦ <span>Snap</span>Class</div><div class="snap-pill">CLOUD ATTENDANCE · COLLEGE DEMO</div></div>
+    <div class="snap-hero">
+      <div class="snap-eyebrow">A smarter classroom workflow</div>
+      <h1>Attendance,<br>without the hassle.</h1>
+      <p>One simple place for teachers to manage classes and record attendance, while students can join subjects and keep track of their attendance history.</p>
+      <div class="snap-hero-card"><div class="snap-stat">Simple. Clear. Connected.</div><div class="snap-muted">A cloud-based attendance experience for classrooms.</div></div>
+    </div>
+    <div class="snap-section"><h2>Everything your class needs</h2><p>Purpose-built tools to make routine attendance easier to manage.</p></div>
+    """, unsafe_allow_html=True)
+    cols = st.columns(3, gap="medium")
+    features = [
+        ("🧑‍🏫", "Teacher workspace", "Create subjects, view enrolled students, and record attendance in one place."),
+        ("🎓", "Student access", "Join a subject with its class code and view your own attendance records."),
+        ("☁️", "Cloud-connected", "Access the app online with Supabase-backed authentication and data."),
+    ]
+    for col, (icon, title, body) in zip(cols, features):
+        with col:
+            st.markdown(f'<div class="snap-feature"><div class="snap-feature-icon">{icon}</div><h3>{title}</h3><p>{body}</p></div>', unsafe_allow_html=True)
+    st.markdown(r"""
+    <div class="snap-section"><h2>Designed around a simple flow</h2><p>Get started in a few steps, whether you teach a class or attend one.</p>
+      <div class="snap-step"><strong>01 · Create an account</strong><p>Choose the teacher or student role during registration.</p></div>
+      <div class="snap-step"><strong>02 · Set up or join a subject</strong><p>Teachers create a subject and share its code; students use that code to join.</p></div>
+      <div class="snap-step"><strong>03 · Record and review</strong><p>Teachers record attendance. Students review their own attendance history and rate.</p></div>
+    </div>
+    <div class="snap-footer">✦ SnapClass · Cloud-based student attendance <span style="float:right">Built for a college demonstration</span></div>
+    """, unsafe_allow_html=True)
+    st.write("")
+    c1, c2, c3 = st.columns([1, 1, 3])
+    with c1:
+        if st.button("Sign in →", type="primary", use_container_width=True, key="home_signin"):
+            st.session_state["snap_page"] = "auth"
+            st.rerun()
+    with c2:
+        if st.button("Create account", use_container_width=True, key="home_signup"):
+            st.session_state["snap_page"] = "auth"
+            st.rerun()
 
-def main():
+
+def main() -> None:
     client = active_client()
 
     if not st.session_state.get("access_token"):
-        login_ui(client)
+        if st.session_state.get("snap_page", "home") == "home":
+            landing_page()
+        else:
+            login_ui(client)
         return
 
     client = active_client()
 
     if not recover_profile(client):
         st.warning(
-            "Your Supabase login exists, but no SnapClass profile "
-            "is linked. Sign out and sign in again. If the problem "
-            "continues, check that a row exists in students or "
-            "teachers with auth_user_id matching your Supabase "
-            "Auth user ID."
+            "Your Supabase login exists, but no SnapClass profile is linked. "
+            "Sign out and sign in again. If the problem remains, check that "
+            "a row exists in students or teachers with auth_user_id equal to "
+            "your Supabase Auth user ID."
         )
-
         if st.button("Sign out"):
             sign_out()
-
         return
 
     with st.sidebar:
         st.markdown("### SnapClass")
-
-        st.caption(
-            st.session_state.get("email", "Signed in")
-        )
-
-        st.write(
-            f'Role: **{st.session_state["role"]}**'
-        )
-
-        if st.button(
-            "Sign out",
-            use_container_width=True,
-        ):
+        st.caption(st.session_state.get("email", "Signed in"))
+        st.write(f'Role: **{st.session_state["role"]}**')
+        if st.button("Sign out", use_container_width=True):
             sign_out()
 
     if st.session_state["role"] == "Teacher":
