@@ -23,6 +23,18 @@ ENGINE_IDENTIFIER = "opencv_sface"
 ENGINE_VERSION = "sface_v1"
 EMBEDDING_DIMENSION = 128
 
+__all__ = [
+    "extract_face_embedding",
+    "compare_faces",
+    "is_sface_profile",
+    "is_legacy_profile",
+    "get_opencv_face_models",
+    "get_dlib_models",
+    "ENGINE_IDENTIFIER",
+    "ENGINE_VERSION",
+    "EMBEDDING_DIMENSION",
+]
+
 
 @st.cache_resource(show_spinner="Loading facial recognition models...")
 def get_opencv_face_models():

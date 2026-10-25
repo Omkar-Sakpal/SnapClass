@@ -3,12 +3,31 @@ import pandas as pd
 from supabase import create_client, Client
 from datetime import datetime, timezone, date, time
 from src.components.student_biometrics_ui import render_student_biometrics_section
-from src.ai.face_engine import (
-    extract_face_embedding,
-    compare_faces,
-    is_sface_profile,
-    is_legacy_profile,
-)
+try:
+    from src.ai.face_engine import (
+        extract_face_embedding,
+        compare_faces,
+        is_sface_profile,
+        is_legacy_profile,
+    )
+except ImportError:
+    from src.ai.face_engine import extract_face_embedding, compare_faces
+
+    def is_sface_profile(bio_face):
+        """Fallback check for OpenCV SFace profile format if face_engine is an older cached version."""
+        if not isinstance(bio_face, dict):
+            return False
+        return (
+            bio_face.get("engine") == "opencv_sface"
+            and isinstance(bio_face.get("embedding"), list)
+            and len(bio_face.get("embedding")) == 128
+        )
+
+    def is_legacy_profile(bio_face):
+        """Fallback check for legacy biometric profile."""
+        if bio_face is None:
+            return False
+        return not is_sface_profile(bio_face)
 
 st.set_page_config(
     page_title="SnapClass | Attendance",
