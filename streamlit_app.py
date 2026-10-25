@@ -2,6 +2,8 @@ import streamlit as st
 import pandas as pd
 from supabase import create_client, Client
 from datetime import datetime, timezone, date, time
+from src.components.student_biometrics_ui import render_student_biometrics_section
+from src.ai.face_engine import extract_face_embedding, compare_faces
 
 st.set_page_config(
     page_title="SnapClass | Attendance",
@@ -192,6 +194,202 @@ def load_enrolled_students(client: Client, subject_id):
     )
 
 
+def get_active_session(subject_id: int):
+    """Retrieve current active attendance session for the subject from session state."""
+    session_key = f"active_session_{subject_id}"
+    return st.session_state.get(session_key)
+
+
+def start_attendance_session(client: Client, teacher_id: int, subject_id: int) -> dict:
+    """Initialize a new active attendance session with a unique ID and UTC timestamp."""
+    now_utc = datetime.now(timezone.utc).replace(microsecond=0)
+    session_id = f"SES-{subject_id}-{now_utc.strftime('%Y%m%d-%H%M%S')}"
+    session_data = {
+        "session_id": session_id,
+        "subject_id": subject_id,
+        "teacher_id": teacher_id,
+        "timestamp": now_utc.isoformat(),
+        "status": "active",
+        "confirmed_student_ids": set(),
+    }
+    session_key = f"active_session_{subject_id}"
+    st.session_state[session_key] = session_data
+
+    # Optional persistence to attendance_sessions if migration was applied in Supabase
+    try:
+        client.table("attendance_sessions").insert({
+            "session_id": session_id,
+            "subject_id": subject_id,
+            "teacher_id": teacher_id,
+            "started_at": now_utc.isoformat(),
+            "status": "active",
+        }).execute()
+    except Exception:
+        pass
+
+    return session_data
+
+
+def end_attendance_session(client: Client, subject_id: int):
+    """End the current active attendance session and archive it."""
+    session_key = f"active_session_{subject_id}"
+    active = st.session_state.pop(session_key, None)
+    if active:
+        active["status"] = "completed"
+        active["ended_at"] = datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+        st.session_state[f"last_completed_session_{subject_id}"] = active
+        try:
+            client.table("attendance_sessions").update({
+                "status": "completed",
+                "ended_at": active["ended_at"],
+            }).eq("session_id", active["session_id"]).execute()
+        except Exception:
+            pass
+    st.session_state.pop(f"candidate_match_{subject_id}", None)
+    return active
+
+
+def record_attendance_entry(
+    client: Client, student_id: int, subject_id: int, timestamp: str, is_present: bool = True
+) -> tuple[bool, str | None]:
+    """
+    Safely saves or updates an attendance record in attendance_logs,
+    preventing duplicate entries for the same student, subject, and session timestamp.
+    """
+    try:
+        existing = (
+            client.table("attendance_logs")
+            .select("attendance_id, is_present")
+            .eq("student_id", student_id)
+            .eq("subject_id", subject_id)
+            .eq("timestamp", timestamp)
+            .limit(1)
+            .execute()
+        )
+        if existing and existing.data:
+            att_id = existing.data[0]["attendance_id"]
+            client.table("attendance_logs").update({
+                "is_present": is_present
+            }).eq("attendance_id", att_id).execute()
+        else:
+            client.table("attendance_logs").insert({
+                "student_id": student_id,
+                "subject_id": subject_id,
+                "timestamp": timestamp,
+                "is_present": is_present,
+            }).execute()
+        return True, None
+    except Exception as exc:
+        return False, f"{type(exc).__name__}: {exc}"
+
+
+def record_batch_attendance(
+    client: Client, student_statuses: list[dict], subject_id: int, timestamp: str
+) -> tuple[int, list[str]]:
+    """
+    Records attendance for multiple students, preventing duplicate entries for the
+    same student, subject, and session timestamp.
+    """
+    errors = []
+    saved_count = 0
+    try:
+        existing_res = (
+            client.table("attendance_logs")
+            .select("attendance_id, student_id, is_present")
+            .eq("subject_id", subject_id)
+            .eq("timestamp", timestamp)
+            .execute()
+        )
+        existing_map = {row["student_id"]: row for row in (existing_res.data or [])}
+    except Exception:
+        existing_map = {}
+
+    to_insert = []
+    for item in student_statuses:
+        sid = item["student_id"]
+        is_p = item["is_present"]
+        if sid in existing_map:
+            if existing_map[sid]["is_present"] != is_p:
+                try:
+                    client.table("attendance_logs").update({
+                        "is_present": is_p
+                    }).eq("attendance_id", existing_map[sid]["attendance_id"]).execute()
+                    saved_count += 1
+                except Exception as exc:
+                    errors.append(f"Student {sid}: {type(exc).__name__}: {exc}")
+            else:
+                saved_count += 1
+        else:
+            to_insert.append({
+                "student_id": sid,
+                "subject_id": subject_id,
+                "timestamp": timestamp,
+                "is_present": is_p,
+            })
+
+    if to_insert:
+        try:
+            client.table("attendance_logs").insert(to_insert).execute()
+            saved_count += len(to_insert)
+        except Exception as exc:
+            errors.append(f"Batch insert error: {type(exc).__name__}: {exc}")
+
+    return saved_count, errors
+
+
+def match_face_to_enrolled_students(
+    client: Client, face_input, enrolled_students: list[dict], threshold: float = 0.60
+) -> tuple[dict | None, float | None, str | None]:
+    """
+    Extracts face embedding from face_input and compares against registered,
+    consented biometrics for students enrolled in the subject.
+    Returns (matched_student_dict, euclidean_distance, error_message).
+    Only returns candidate match if distance <= threshold.
+    """
+    if not enrolled_students:
+        return None, None, "No students are enrolled in this subject."
+
+    emb, err = extract_face_embedding(face_input)
+    if err or not emb:
+        return None, None, err or "Could not extract facial features."
+
+    student_ids = [s["student_id"] for s in enrolled_students]
+    try:
+        bio_records = (
+            client.table("student_biometrics")
+            .select("student_id, face_embedding, consent_given")
+            .in_("student_id", student_ids)
+            .eq("consent_given", True)
+            .execute()
+            .data
+        )
+    except Exception as exc:
+        return None, None, f"Could not load biometric profiles: {type(exc).__name__}: {exc}"
+
+    if not bio_records:
+        return None, None, "No enrolled students have registered a consented facial biometric profile."
+
+    best_match = None
+    min_dist = float("inf")
+
+    student_map = {s["student_id"]: s for s in enrolled_students}
+    for bio in bio_records:
+        profile_emb = bio.get("face_embedding")
+        if not profile_emb:
+            continue
+        dist = compare_faces(emb, profile_emb)
+        if dist < min_dist:
+            min_dist = dist
+            best_match = student_map.get(bio["student_id"])
+
+    if best_match and min_dist <= threshold:
+        return best_match, min_dist, None
+    elif best_match:
+        return None, min_dist, f"Nearest enrolled student ({best_match['name']}) had match distance {min_dist:.3f}, which exceeds threshold ({threshold})."
+    else:
+        return None, None, "No enrolled students with registered face embeddings found."
+
+
 def teacher_dashboard(client: Client) -> None:
     st.title("Teacher dashboard")
     st.write("Create a subject, record attendance, and correct records for any previous date.")
@@ -235,6 +433,33 @@ def teacher_dashboard(client: Client) -> None:
     subject = subject_map[selected_label]
     subject_id = subject["subject_id"]
 
+    active_session = get_active_session(subject_id)
+
+    st.markdown("#### ⏱️ Attendance Session")
+    if not active_session:
+        col_s1, col_s2 = st.columns([2, 3])
+        with col_s1:
+            if st.button("▶️ Start Attendance Session", type="primary", key=f"btn_start_session_{subject_id}"):
+                sess = start_attendance_session(client, st.session_state["profile_id"], subject_id)
+                st.success(f"Started attendance session: {sess['session_id']}")
+                st.rerun()
+        with col_s2:
+            st.caption("Start an active session to coordinate manual and face-assisted attendance with unique timestamping.")
+    else:
+        with st.container(border=True):
+            col_info, col_btn = st.columns([3, 1])
+            with col_info:
+                st.markdown(f"🟢 **Active Session:** `{active_session['session_id']}`")
+                st.caption(f"Started: {active_session['timestamp']} UTC · Subject: {subject['name']} ({subject['section']})")
+                num_confirmed = len(active_session.get("confirmed_student_ids", set()))
+                if num_confirmed > 0:
+                    st.info(f"Verified & recorded in this session: **{num_confirmed}** student(s)")
+            with col_btn:
+                if st.button("⏹️ End Attendance Session", type="secondary", key=f"btn_end_session_{subject_id}"):
+                    ended = end_attendance_session(client, subject_id)
+                    st.info(f"Attendance session {ended['session_id'] if ended else ''} ended.")
+                    st.rerun()
+
     st.subheader("Enrolled students")
     try:
         students = load_enrolled_students(client, subject_id)
@@ -245,32 +470,107 @@ def teacher_dashboard(client: Client) -> None:
         st.info("No students enrolled yet.")
         return
 
-    tab_record, tab_update = st.tabs(["Record attendance", "Update attendance"])
+    tab_record, tab_face, tab_update = st.tabs([
+        "📝 Record attendance",
+        "📸 Face-assisted attendance",
+        "✏️ Update attendance"
+    ])
     with tab_record:
-        st.caption("Check the students who are present. Unchecked students will be recorded absent.")
+        if active_session:
+            st.caption(f"Recording for active session `{active_session['session_id']}`. Check the students who are present. Unchecked students will be recorded absent.")
+        else:
+            st.caption("Check the students who are present. Unchecked students will be recorded absent.")
+
         with st.form(f"record_attendance_{subject_id}"):
             present_ids = []
+            confirmed_set = active_session.get("confirmed_student_ids", set()) if active_session else set()
             for student in students:
+                is_prechecked = student["student_id"] in confirmed_set
                 if st.checkbox(
                     f'{student["name"]} ({student.get("email") or "no email"})',
+                    value=is_prechecked,
                     key=f'record_present_{subject_id}_{student["student_id"]}',
                 ):
                     present_ids.append(student["student_id"])
             save = st.form_submit_button("Save attendance", type="primary")
+
         if save:
-            timestamp = datetime.now(timezone.utc).replace(microsecond=0).isoformat()
-            rows = [{
-                "student_id": student["student_id"],
-                "subject_id": subject_id,
-                "timestamp": timestamp,
-                "is_present": student["student_id"] in present_ids,
-            } for student in students]
-            try:
-                client.table("attendance_logs").insert(rows).execute()
-                st.success(f"Attendance saved for {len(rows)} students.")
+            if not active_session:
+                active_session = start_attendance_session(client, st.session_state["profile_id"], subject_id)
+            session_ts = active_session["timestamp"]
+
+            student_statuses = [
+                {"student_id": s["student_id"], "is_present": s["student_id"] in present_ids}
+                for s in students
+            ]
+            saved_count, errors = record_batch_attendance(client, student_statuses, subject_id, session_ts)
+            if errors:
+                st.error("Some records could not be saved:\n" + "\n".join(errors))
+            if saved_count:
+                for s in students:
+                    if s["student_id"] in present_ids and active_session:
+                        active_session.setdefault("confirmed_student_ids", set()).add(s["student_id"])
+                st.success(f"Attendance saved for {saved_count} students in session `{active_session['session_id']}`.")
                 st.rerun()
-            except Exception as e:
-                st.error(f"Attendance could not be saved: {type(e).__name__}: {e}")
+
+    with tab_face:
+        st.markdown("##### 📸 Face-Assisted Attendance (AI Verification)")
+        st.write(
+            "Quickly verify student attendance by comparing a webcam snapshot against registered, "
+            "consented facial templates. **Attendance is never recorded automatically**; the teacher "
+            "must confirm candidate matches."
+        )
+
+        if not active_session:
+            st.info("👉 Please start an active attendance session above before using face-assisted attendance.")
+        else:
+            face_cam = st.camera_input("Capture student face", key=f"teacher_face_cam_{subject_id}")
+            if face_cam is not None:
+                if st.button("🔍 Identify Enrolled Student", type="primary", key=f"btn_identify_{subject_id}"):
+                    with st.spinner("Comparing facial features against registered student profiles..."):
+                        matched, dist, err = match_face_to_enrolled_students(client, face_cam, students, threshold=0.60)
+                    if err:
+                        st.warning(f"Identification notice: {err}")
+                        st.session_state.pop(f"candidate_match_{subject_id}", None)
+                    elif matched:
+                        st.session_state[f"candidate_match_{subject_id}"] = {
+                            "student": matched,
+                            "distance": dist,
+                        }
+                        st.rerun()
+
+            candidate_data = st.session_state.get(f"candidate_match_{subject_id}")
+            if candidate_data:
+                c_student = candidate_data["student"]
+                c_dist = candidate_data["distance"]
+                with st.container(border=True):
+                    st.markdown(f"### 👤 Candidate Match: **{c_student['name']}**")
+                    st.write(f"Email: `{c_student.get('email') or 'No email'}`")
+                    st.write(f"Euclidean distance: `{c_dist:.3f}` *(Threshold: ≤ 0.60, lower is closer)*")
+                    st.warning("⚠️ **Human Review Required:** Biometric detection is an assistive suggestion only. Do not mark present without visual confirmation.")
+
+                    col_conf, col_dismiss = st.columns(2)
+                    with col_conf:
+                        if st.button(f"✅ Confirm & Mark {c_student['name']} Present", type="primary", key=f"btn_confirm_{c_student['student_id']}"):
+                            ok, err = record_attendance_entry(
+                                client,
+                                c_student["student_id"],
+                                subject_id,
+                                active_session["timestamp"],
+                                is_present=True,
+                            )
+                            if ok:
+                                active_session.setdefault("confirmed_student_ids", set()).add(c_student["student_id"])
+                                st.session_state.pop(f"candidate_match_{subject_id}", None)
+                                st.success(f"✅ Attendance confirmed and recorded for {c_student['name']}!")
+                                st.rerun()
+                            else:
+                                st.error(f"Failed to record attendance: {err}")
+                    with col_dismiss:
+                        if st.button("❌ Dismiss / Not this student", key=f"btn_dismiss_{c_student['student_id']}"):
+                            st.session_state.pop(f"candidate_match_{subject_id}", None)
+                            st.info("Dismissed candidate match.")
+                            st.rerun()
 
     with tab_update:
         st.write("Choose a past class date, review its saved attendance, and correct statuses.")
@@ -301,10 +601,12 @@ def teacher_dashboard(client: Client) -> None:
                 # each row and let the teacher choose which session to edit.
                 by_student.setdefault(sid, []).append(row)
             session_options = {}
+            active_ts = active_session["timestamp"] if active_session else None
             for sid, records in by_student.items():
                 student_name = next((s["name"] for s in students if s["student_id"] == sid), f"Student {sid}")
                 for record in records:
-                    label = f'{student_name} · {record["timestamp"]}'
+                    tag = " 🟢 [ACTIVE SESSION]" if active_ts and record["timestamp"] == active_ts else ""
+                    label = f'{student_name} · {record["timestamp"]}{tag}'
                     session_options[label] = record
 
             selected_record_labels = st.multiselect(
@@ -391,48 +693,55 @@ def student_dashboard(client: Client) -> None:
                         st.rerun()
             except Exception as e:
                 st.error(f"Could not join subject: {type(e).__name__}: {e}")
-    st.subheader("My attendance")
     student_id = st.session_state.get("profile_id")
     if student_id is None:
         st.error("Your student profile ID is missing. Sign out and sign in again.")
         return
-    try:
-        rows = (
-            client.table("attendance_logs").select("subject_id,timestamp,is_present")
-            .eq("student_id", student_id).order("timestamp", desc=True).execute().data
-        )
-        if not rows:
-            st.info(
-                "No attendance records were returned for your student profile. "
-                "If a teacher has marked attendance, check the attendance_logs "
-                "SELECT policy and confirm that your student_id matches the record in Supabase."
+
+    tab_att, tab_bio = st.tabs(["📊 My Attendance", "🧬 Biometric Registration"])
+
+    with tab_att:
+        st.subheader("My attendance")
+        try:
+            rows = (
+                client.table("attendance_logs").select("subject_id,timestamp,is_present")
+                .eq("student_id", student_id).order("timestamp", desc=True).execute().data
             )
-            return
-        subject_ids = sorted({row["subject_id"] for row in rows})
-        subjects = (
-            client.table("subjects").select("subject_id,name,subject_code")
-            .in_("subject_id", subject_ids).execute().data
-        )
-        subject_names = {
-            s["subject_id"]: f'{s["name"]} ({s["subject_code"]})' for s in subjects
-        }
-        df = pd.DataFrame(rows)
-        df["subject"] = df["subject_id"].map(subject_names).fillna(
-            df["subject_id"].map(lambda value: f"Subject {value}")
-        )
-        df["status"] = df["is_present"].map({True: "Present", False: "Absent"}).fillna("Unknown")
-        df["timestamp"] = pd.to_datetime(df["timestamp"], errors="coerce", utc=True)
-        df["timestamp"] = df["timestamp"].dt.strftime("%Y-%m-%d %H:%M:%S UTC")
-        st.dataframe(df[["subject", "timestamp", "status"]], use_container_width=True, hide_index=True)
-        total = len(rows)
-        present = sum(row.get("is_present") is True for row in rows)
-        st.metric("Attendance rate", f"{present / total:.0%}" if total else "—")
-    except Exception as e:
-        st.error("Could not load attendance from Supabase. " f"Error: {type(e).__name__}: {e}")
-        st.caption(
-            "If the error mentions permission denied, inspect the SELECT RLS policies "
-            "on attendance_logs and subjects. Do not disable RLS or use a service-role key in the app."
-        )
+            if not rows:
+                st.info(
+                    "No attendance records were returned for your student profile. "
+                    "If a teacher has marked attendance, check the attendance_logs "
+                    "SELECT policy and confirm that your student_id matches the record in Supabase."
+                )
+            else:
+                subject_ids = sorted({row["subject_id"] for row in rows})
+                subjects = (
+                    client.table("subjects").select("subject_id,name,subject_code")
+                    .in_("subject_id", subject_ids).execute().data
+                )
+                subject_names = {
+                    s["subject_id"]: f'{s["name"]} ({s["subject_code"]})' for s in subjects
+                }
+                df = pd.DataFrame(rows)
+                df["subject"] = df["subject_id"].map(subject_names).fillna(
+                    df["subject_id"].map(lambda value: f"Subject {value}")
+                )
+                df["status"] = df["is_present"].map({True: "Present", False: "Absent"}).fillna("Unknown")
+                df["timestamp"] = pd.to_datetime(df["timestamp"], errors="coerce", utc=True)
+                df["timestamp"] = df["timestamp"].dt.strftime("%Y-%m-%d %H:%M:%S UTC")
+                st.dataframe(df[["subject", "timestamp", "status"]], use_container_width=True, hide_index=True)
+                total = len(rows)
+                present = sum(row.get("is_present") is True for row in rows)
+                st.metric("Attendance rate", f"{present / total:.0%}" if total else "—")
+        except Exception as e:
+            st.error("Could not load attendance from Supabase. " f"Error: {type(e).__name__}: {e}")
+            st.caption(
+                "If the error mentions permission denied, inspect the SELECT RLS policies "
+                "on attendance_logs and subjects. Do not disable RLS or use a service-role key in the app."
+            )
+
+    with tab_bio:
+        render_student_biometrics_section(client, student_id)
 
 
 def landing_page() -> None:
