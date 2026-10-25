@@ -3,7 +3,12 @@ import pandas as pd
 from supabase import create_client, Client
 from datetime import datetime, timezone, date, time
 from src.components.student_biometrics_ui import render_student_biometrics_section
-from src.ai.face_engine import extract_face_embedding, compare_faces
+from src.ai.face_engine import (
+    extract_face_embedding,
+    compare_faces,
+    is_sface_profile,
+    is_legacy_profile,
+)
 
 st.set_page_config(
     page_title="SnapClass | Attendance",
@@ -343,7 +348,8 @@ def match_face_to_enrolled_students(
     """
     Extracts face embedding from face_input and compares against registered,
     consented biometrics for students enrolled in the subject.
-    Returns (matched_student_dict, euclidean_distance, error_message).
+    Filters strictly for OpenCV SFace profiles and ignores incompatible legacy profiles.
+    Returns (matched_student_dict, distance, error_message).
     Only returns candidate match if distance <= threshold.
     """
     if not enrolled_students:
@@ -369,11 +375,23 @@ def match_face_to_enrolled_students(
     if not bio_records:
         return None, None, "No enrolled students have registered a consented facial biometric profile."
 
+    compatible_bios = [b for b in bio_records if is_sface_profile(b.get("face_embedding"))]
+    legacy_bios = [b for b in bio_records if is_legacy_profile(b.get("face_embedding"))]
+
+    if not compatible_bios:
+        if legacy_bios:
+            return (
+                None,
+                None,
+                f"{len(legacy_bios)} enrolled student(s) have legacy face profiles and must re-register using the OpenCV SFace engine before face matching can identify them. Manual attendance remains available.",
+            )
+        return None, None, "No enrolled students have registered a compatible SFace facial biometric profile."
+
     best_match = None
     min_dist = float("inf")
 
     student_map = {s["student_id"]: s for s in enrolled_students}
-    for bio in bio_records:
+    for bio in compatible_bios:
         profile_emb = bio.get("face_embedding")
         if not profile_emb:
             continue
@@ -387,7 +405,7 @@ def match_face_to_enrolled_students(
     elif best_match:
         return None, min_dist, f"Nearest enrolled student ({best_match['name']}) had match distance {min_dist:.3f}, which exceeds threshold ({threshold})."
     else:
-        return None, None, "No enrolled students with registered face embeddings found."
+        return None, None, "No enrolled students with registered SFace embeddings found."
 
 
 def teacher_dashboard(client: Client) -> None:
@@ -546,7 +564,7 @@ def teacher_dashboard(client: Client) -> None:
                 with st.container(border=True):
                     st.markdown(f"### 👤 Candidate Match: **{c_student['name']}**")
                     st.write(f"Email: `{c_student.get('email') or 'No email'}`")
-                    st.write(f"Euclidean distance: `{c_dist:.3f}` *(Threshold: ≤ 0.60, lower is closer)*")
+                    st.write(f"Match distance (SFace Cosine): `{c_dist:.3f}` *(Threshold: ≤ 0.60, lower is closer)*")
                     st.warning("⚠️ **Human Review Required:** Biometric detection is an assistive suggestion only. Do not mark present without visual confirmation.")
 
                     col_conf, col_dismiss = st.columns(2)

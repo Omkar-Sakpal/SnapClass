@@ -172,18 +172,24 @@ class TestTeacherAttendanceSessions(unittest.TestCase):
             {"student_id": 102, "name": "Bob Smith", "email": "bob@example.com"},
         ]
 
-        # Populate student_biometrics for Alice (consented, 128-d vector)
-        alice_emb = [0.1] * 128
+        # Populate student_biometrics for Alice (consented, 128-d SFace vector)
+        alice_vec = [0.1] * 128
+        alice_payload = {
+            "version": "sface_v1",
+            "engine": "opencv_sface",
+            "embedding": alice_vec,
+            "dim": 128,
+        }
         self.client.table("student_biometrics").rows = [
             {
                 "student_id": 101,
-                "face_embedding": alice_emb,
+                "face_embedding": alice_payload,
                 "consent_given": True,
             }
         ]
 
-        # Mock extract_face_embedding to return matching vector
-        with patch("streamlit_app.extract_face_embedding", return_value=(alice_emb, None)):
+        # Mock extract_face_embedding to return matching SFace payload
+        with patch("streamlit_app.extract_face_embedding", return_value=(alice_payload, None)):
             matched, dist, err = match_face_to_enrolled_students(
                 self.client, b"dummy_face_image", enrolled_students, threshold=0.60
             )
@@ -193,21 +199,55 @@ class TestTeacherAttendanceSessions(unittest.TestCase):
             self.assertEqual(matched["name"], "Alice Johnson")
             self.assertLess(dist, 1e-4)
 
+    def test_face_assisted_matching_rejects_legacy_dlib_profile(self):
+        """Verifies legacy dlib profiles are safely isolated and never compared against SFace vectors."""
+        enrolled_students = [
+            {"student_id": 101, "name": "Alice Johnson", "email": "alice@example.com"},
+        ]
+        # Legacy dlib profile is stored as a raw list of 128 floats
+        self.client.table("student_biometrics").rows = [
+            {
+                "student_id": 101,
+                "face_embedding": [0.1] * 128,
+                "consent_given": True,
+            }
+        ]
+
+        sface_payload = {
+            "version": "sface_v1",
+            "engine": "opencv_sface",
+            "embedding": [0.1] * 128,
+            "dim": 128,
+        }
+        with patch("streamlit_app.extract_face_embedding", return_value=(sface_payload, None)):
+            matched, dist, err = match_face_to_enrolled_students(
+                self.client, b"dummy_face_image", enrolled_students, threshold=0.60
+            )
+            self.assertIsNone(matched)
+            self.assertIn("legacy face profiles", err)
+            self.assertIn("re-register", err)
+
     def test_face_assisted_matching_rejects_unconsented_or_unregistered(self):
         """If no enrolled student has a consented biometric profile, no candidate match is returned."""
         enrolled_students = [
             {"student_id": 101, "name": "Alice Johnson", "email": "alice@example.com"},
         ]
         # Biometrics exist but consent_given is False
+        sface_payload = {
+            "version": "sface_v1",
+            "engine": "opencv_sface",
+            "embedding": [0.1] * 128,
+            "dim": 128,
+        }
         self.client.table("student_biometrics").rows = [
             {
                 "student_id": 101,
-                "face_embedding": [0.1] * 128,
+                "face_embedding": sface_payload,
                 "consent_given": False,
             }
         ]
 
-        with patch("streamlit_app.extract_face_embedding", return_value=([0.1] * 128, None)):
+        with patch("streamlit_app.extract_face_embedding", return_value=(sface_payload, None)):
             matched, dist, err = match_face_to_enrolled_students(
                 self.client, b"dummy_face_image", enrolled_students, threshold=0.60
             )
@@ -215,22 +255,34 @@ class TestTeacherAttendanceSessions(unittest.TestCase):
             self.assertIn("No enrolled students have registered a consented", err)
 
     def test_face_assisted_matching_rejects_distant_face(self):
-        """If facial distance exceeds Euclidean threshold (0.60), match must be rejected."""
+        """If facial distance exceeds threshold (0.60), match must be rejected."""
         enrolled_students = [
             {"student_id": 101, "name": "Alice Johnson", "email": "alice@example.com"},
         ]
-        alice_emb = [1.0] + [0.0] * 127
+        alice_vec = [1.0] + [0.0] * 127
+        alice_payload = {
+            "version": "sface_v1",
+            "engine": "opencv_sface",
+            "embedding": alice_vec,
+            "dim": 128,
+        }
         self.client.table("student_biometrics").rows = [
             {
                 "student_id": 101,
-                "face_embedding": alice_emb,
+                "face_embedding": alice_payload,
                 "consent_given": True,
             }
         ]
 
-        # Different person's face (orthogonal vector, distance = sqrt(2) ≈ 1.414)
-        stranger_emb = [0.0, 1.0] + [0.0] * 126
-        with patch("streamlit_app.extract_face_embedding", return_value=(stranger_emb, None)):
+        # Different person's face (orthogonal vector, cosine distance = 1.0)
+        stranger_vec = [0.0, 1.0] + [0.0] * 126
+        stranger_payload = {
+            "version": "sface_v1",
+            "engine": "opencv_sface",
+            "embedding": stranger_vec,
+            "dim": 128,
+        }
+        with patch("streamlit_app.extract_face_embedding", return_value=(stranger_payload, None)):
             matched, dist, err = match_face_to_enrolled_students(
                 self.client, b"stranger_img", enrolled_students, threshold=0.60
             )
@@ -246,11 +298,17 @@ class TestTeacherAttendanceSessions(unittest.TestCase):
         enrolled_students = [
             {"student_id": 101, "name": "Alice Johnson", "email": "alice@example.com"},
         ]
+        sface_payload = {
+            "version": "sface_v1",
+            "engine": "opencv_sface",
+            "embedding": [0.1] * 128,
+            "dim": 128,
+        }
         self.client.table("student_biometrics").rows = [
-            {"student_id": 101, "face_embedding": [0.1] * 128, "consent_given": True}
+            {"student_id": 101, "face_embedding": sface_payload, "consent_given": True}
         ]
 
-        with patch("streamlit_app.extract_face_embedding", return_value=([0.1] * 128, None)):
+        with patch("streamlit_app.extract_face_embedding", return_value=(sface_payload, None)):
             matched, dist, err = match_face_to_enrolled_students(
                 self.client, b"img", enrolled_students, threshold=0.60
             )
