@@ -11,7 +11,11 @@ from typing import Tuple, Optional
 import streamlit as st
 from supabase import Client
 
-from src.ai.face_engine import extract_face_embedding
+from src.ai.face_engine import (
+    extract_face_embedding,
+    is_sface_profile,
+    is_legacy_profile,
+)
 from src.ai.voice_engine import extract_voice_embedding
 
 
@@ -102,7 +106,10 @@ def render_student_biometrics_section(client: Client, student_id: int) -> None:
 
     # 2. Query current profile state
     bio_record = load_student_biometrics(client, student_id)
-    has_face = bool(bio_record and bio_record.get("face_embedding"))
+    face_raw = bio_record.get("face_embedding") if bio_record else None
+    has_face_sface = is_sface_profile(face_raw)
+    has_face_legacy = is_legacy_profile(face_raw)
+    has_face = bool(has_face_sface or has_face_legacy)
     has_voice = bool(bio_record and bio_record.get("voice_embedding"))
     has_consent = bool(bio_record and bio_record.get("consent_given"))
 
@@ -110,8 +117,10 @@ def render_student_biometrics_section(client: Client, student_id: int) -> None:
     st.markdown("#### Current Profile Status")
     col1, col2, col3 = st.columns(3)
     with col1:
-        if has_face:
-            st.success("🟢 Face Profile: Registered")
+        if has_face_sface:
+            st.success("🟢 Face Profile: Registered (SFace)")
+        elif has_face_legacy:
+            st.warning("🟡 Face Profile: Legacy Engine (Update needed)")
         else:
             st.info("⚪ Face Profile: Not registered")
     with col2:
@@ -165,11 +174,18 @@ def render_student_biometrics_section(client: Client, student_id: int) -> None:
     )
 
     with tab_face:
-        st.markdown("##### Facial Profile Registration")
+        st.markdown("##### Facial Profile Registration (OpenCV YuNet + SFace)")
         st.write(
-            "Captures a frontal webcam snapshot to extract a 128-dimensional facial descriptor using dlib ResNet. "
+            "Captures a frontal webcam snapshot to extract a 128-dimensional facial descriptor using OpenCV YuNet & SFace. "
             "Ensure adequate frontal lighting, look straight into the camera, and ensure only one person is in frame."
         )
+
+        if has_face_legacy:
+            st.warning(
+                "⚠️ **Re-registration Required:** Your face profile was registered with an earlier face engine. "
+                "SnapClass now uses the cloud-compatible OpenCV SFace engine. Please take a snapshot and click "
+                "**Register Face Profile** below to update your profile for AI-assisted attendance."
+            )
 
         if st.session_state.pop("face_registration_success", None):
             st.success("✅ Face profile registered successfully!")

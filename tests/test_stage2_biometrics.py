@@ -16,7 +16,14 @@ from PIL import Image, ImageDraw
 # Add project root to sys.path
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
-from src.ai.face_engine import extract_face_embedding, compare_faces, get_dlib_models
+from src.ai.face_engine import (
+    extract_face_embedding,
+    compare_faces,
+    get_dlib_models,
+    get_opencv_face_models,
+    is_sface_profile,
+    is_legacy_profile,
+)
 from src.ai.voice_engine import extract_voice_embedding, compare_voices, _decode_audio_bytes
 from src.components.student_biometrics_ui import (
     _verify_authenticated_student,
@@ -69,22 +76,36 @@ def create_synthetic_wav(duration=1.5, sr=16000, silent=False) -> bytes:
 
 
 class TestFaceEngine(unittest.TestCase):
-    @unittest.skipUnless(get_dlib_models()["available"], "dlib models unavailable on this host")
-    def test_dlib_models_available(self):
-        models = get_dlib_models()
-        self.assertTrue(models["available"], f"dlib models failed to load: {models['error']}")
+    def test_opencv_face_models_available(self):
+        models = get_opencv_face_models()
+        self.assertTrue(models["available"], f"OpenCV face models failed to load: {models['error']}")
         self.assertIsNotNone(models["detector"])
+        self.assertIsNotNone(models["recognizer"])
         self.assertIsNotNone(models["shape_predictor"])
         self.assertIsNotNone(models["face_encoder"])
 
-    @unittest.skipUnless(get_dlib_models()["available"], "dlib models unavailable on this host")
     def test_extract_face_embedding_success(self):
         img = create_synthetic_face(has_face=True)
-        emb, err = extract_face_embedding(img)
-        self.assertIsNone(err)
-        self.assertIsNotNone(emb)
-        self.assertEqual(len(emb), 128)
-        self.assertTrue(all(isinstance(x, float) for x in emb))
+        mock_face = np.array([[30, 30, 140, 140, 70, 70, 130, 70, 100, 100, 75, 140, 125, 140, 0.95]], dtype=np.float32)
+        real_models = get_opencv_face_models()
+        mock_detector = MagicMock()
+        mock_detector.detect.return_value = (1, mock_face)
+        mock_models = {
+            "available": True,
+            "detector": mock_detector,
+            "recognizer": real_models["recognizer"],
+            "shape_predictor": real_models["recognizer"],
+            "face_encoder": real_models["recognizer"],
+            "error": None,
+        }
+        with patch("src.ai.face_engine.get_opencv_face_models", return_value=mock_models):
+            emb, err = extract_face_embedding(img)
+            self.assertIsNone(err)
+            self.assertIsNotNone(emb)
+            self.assertEqual(emb.get("engine"), "opencv_sface")
+            self.assertEqual(emb.get("version"), "sface_v1")
+            self.assertEqual(len(emb.get("embedding", [])), 128)
+            self.assertTrue(all(isinstance(x, float) for x in emb["embedding"]))
 
     def test_extract_face_embedding_no_face(self):
         img = create_synthetic_face(has_face=False)
@@ -93,29 +114,75 @@ class TestFaceEngine(unittest.TestCase):
         self.assertIsNotNone(err)
         self.assertIn("No face detected", err)
 
+    def test_extract_face_embedding_multiple_faces(self):
+        img = create_synthetic_face(has_face=True)
+        mock_faces = np.array([
+            [30, 30, 60, 60, 45, 45, 55, 45, 50, 50, 45, 55, 55, 55, 0.95],
+            [110, 30, 60, 60, 125, 45, 135, 45, 130, 50, 125, 55, 135, 55, 0.92]
+        ], dtype=np.float32)
+        real_models = get_opencv_face_models()
+        mock_detector = MagicMock()
+        mock_detector.detect.return_value = (2, mock_faces)
+        mock_models = {
+            "available": True,
+            "detector": mock_detector,
+            "recognizer": real_models["recognizer"],
+            "shape_predictor": real_models["recognizer"],
+            "face_encoder": real_models["recognizer"],
+            "error": None,
+        }
+        with patch("src.ai.face_engine.get_opencv_face_models", return_value=mock_models):
+            emb, err = extract_face_embedding(img)
+            self.assertIsNone(emb)
+            self.assertIsNotNone(err)
+            self.assertIn("Multiple faces (2) detected", err)
+
     def test_face_comparison_identity(self):
         img = create_synthetic_face(has_face=True)
-        emb1, _ = extract_face_embedding(img)
-        emb2, _ = extract_face_embedding(img)
-        dist = compare_faces(emb1, emb2)
-        self.assertLess(dist, 1e-4, f"Identical face distance should be ~0, got {dist}")
+        mock_face = np.array([[30, 30, 140, 140, 70, 70, 130, 70, 100, 100, 75, 140, 125, 140, 0.95]], dtype=np.float32)
+        real_models = get_opencv_face_models()
+        mock_detector = MagicMock()
+        mock_detector.detect.return_value = (1, mock_face)
+        mock_models = {
+            "available": True,
+            "detector": mock_detector,
+            "recognizer": real_models["recognizer"],
+            "shape_predictor": real_models["recognizer"],
+            "face_encoder": real_models["recognizer"],
+            "error": None,
+        }
+        with patch("src.ai.face_engine.get_opencv_face_models", return_value=mock_models):
+            emb1, _ = extract_face_embedding(img)
+            emb2, _ = extract_face_embedding(img)
+            dist = compare_faces(emb1, emb2)
+            self.assertLess(dist, 1e-4, f"Identical face distance should be ~0, got {dist}")
 
     def test_face_comparison_dissimilar_embeddings_rejected(self):
         """
-        Verify that dissimilar embeddings are rejected by Euclidean distance thresholding.
+        Verify that dissimilar embeddings are rejected by Cosine distance thresholding.
         Face match requires distance <= 0.60. Dissimilar faces have distance > 0.60.
         """
         # Deterministic orthogonal unit vectors of 128 dimensions
         emb1 = [1.0] + [0.0] * 127
         emb2 = [0.0, 1.0] + [0.0] * 126
         dist = compare_faces(emb1, emb2)
-        # Euclidean distance of orthogonal unit vectors: sqrt(1^2 + 1^2) = sqrt(2) ≈ 1.414
+        # Cosine distance of orthogonal unit vectors: 1.0 - 0.0 = 1.0
         self.assertGreater(dist, 0.60, f"Dissimilar faces should have distance > 0.60, got {dist}")
 
-        # Opposite vectors: distance = 2.0
+        # Opposite vectors: Cosine distance = 2.0
         emb_opp = [-1.0] + [0.0] * 127
         dist_opp = compare_faces(emb1, emb_opp)
         self.assertGreater(dist_opp, 1.0, f"Opposite vectors should have distance > 1.0, got {dist_opp}")
+
+    def test_profile_engine_classification(self):
+        sface_prof = {"version": "sface_v1", "engine": "opencv_sface", "embedding": [0.1] * 128}
+        legacy_prof = [0.1] * 128
+        self.assertTrue(is_sface_profile(sface_prof))
+        self.assertFalse(is_legacy_profile(sface_prof))
+        self.assertFalse(is_sface_profile(legacy_prof))
+        self.assertTrue(is_legacy_profile(legacy_prof))
+        self.assertFalse(is_sface_profile(None))
+        self.assertFalse(is_legacy_profile(None))
 
 
 class TestVoiceEngine(unittest.TestCase):
