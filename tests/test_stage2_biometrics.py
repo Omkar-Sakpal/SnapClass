@@ -16,7 +16,7 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")
 
 from src.ai.face_engine import extract_face_embedding, compare_faces, get_dlib_models
 from src.ai.voice_engine import extract_voice_embedding, compare_voices, _decode_audio_bytes
-from src.components.student_biometrics_ui import _verify_authenticated_student
+from src.components.student_biometrics_ui import _verify_authenticated_student, delete_student_biometrics
 
 
 def create_synthetic_face(has_face=True) -> Image.Image:
@@ -91,6 +91,23 @@ class TestFaceEngine(unittest.TestCase):
         dist = compare_faces(emb1, emb2)
         self.assertLess(dist, 1e-4, f"Identical face distance should be ~0, got {dist}")
 
+    def test_face_comparison_dissimilar_embeddings_rejected(self):
+        """
+        Verify that dissimilar embeddings are rejected by Euclidean distance thresholding.
+        Face match requires distance <= 0.60. Dissimilar faces have distance > 0.60.
+        """
+        # Deterministic orthogonal unit vectors of 128 dimensions
+        emb1 = [1.0] + [0.0] * 127
+        emb2 = [0.0, 1.0] + [0.0] * 126
+        dist = compare_faces(emb1, emb2)
+        # Euclidean distance of orthogonal unit vectors: sqrt(1^2 + 1^2) = sqrt(2) ≈ 1.414
+        self.assertGreater(dist, 0.60, f"Dissimilar faces should have distance > 0.60, got {dist}")
+
+        # Opposite vectors: distance = 2.0
+        emb_opp = [-1.0] + [0.0] * 127
+        dist_opp = compare_faces(emb1, emb_opp)
+        self.assertGreater(dist_opp, 1.0, f"Opposite vectors should have distance > 1.0, got {dist_opp}")
+
 
 class TestVoiceEngine(unittest.TestCase):
     def test_decode_wav_bytes(self):
@@ -130,6 +147,38 @@ class TestVoiceEngine(unittest.TestCase):
         sim = compare_voices(emb1, emb2)
         self.assertGreater(sim, 0.99, f"Identical voice similarity should be ~1.0, got {sim}")
 
+    def test_voice_comparison_dissimilar_embeddings(self):
+        """
+        Verify that dissimilar voice embeddings are rejected under cosine similarity comparison.
+        Speaker match requires similarity >= 0.68.
+        Orthogonal or unrelated vectors must yield low similarity (< 0.68).
+        """
+        # Deterministic orthogonal unit vectors
+        emb1 = [1.0] + [0.0] * 127
+        emb2 = [0.0, 1.0] + [0.0] * 126
+        sim = compare_voices(emb1, emb2)
+        self.assertAlmostEqual(sim, 0.0, places=4)
+        self.assertLess(sim, 0.68, f"Orthogonal voice embeddings must have similarity < 0.68, got {sim}")
+
+        # Opposite vectors
+        emb_opp = [-1.0] + [0.0] * 127
+        sim_opp = compare_voices(emb1, emb_opp)
+        self.assertAlmostEqual(sim_opp, -1.0, places=4)
+        self.assertLess(sim_opp, 0.68, f"Opposite voice embeddings must have similarity < 0.68, got {sim_opp}")
+
+    def test_scipy_voice_fallback_limitation_documented(self):
+        """
+        Verify that SciPy spectral fallback limitations are explicitly documented in voice_engine.
+        The spectral fallback extracts acoustic frequency power distributions and cannot reliably
+        discriminate individual speakers without deep learning (e.g. Resemblyzer).
+        """
+        import src.ai.voice_engine as voice_engine
+
+        doc = (voice_engine.__doc__ or "").lower()
+        self.assertIn("spectral-temporal", doc)
+        self.assertIn("scipy", doc)
+        self.assertIn("not an identity-grade speaker discriminator", doc)
+
 
 class TestStudentBiometricsSecurity(unittest.TestCase):
     def test_unverified_student_rejected(self):
@@ -153,6 +202,134 @@ class TestStudentBiometricsSecurity(unittest.TestCase):
         st.session_state["user_id"] = "fake-auth-id"
         verified = _verify_authenticated_student(MockClient(), student_id=999)
         self.assertFalse(verified)
+
+    def test_delete_biometrics_success(self):
+        class MockQuery:
+            def __init__(self, table_name):
+                self.table_name = table_name
+            def select(self, *a, **kw):
+                return self
+            def eq(self, *a, **kw):
+                return self
+            def limit(self, *a, **kw):
+                return self
+            def maybe_single(self):
+                return self
+            def delete(self):
+                return self
+            def execute(self):
+                class Res:
+                    pass
+                res = Res()
+                if self.table_name == "students":
+                    res.data = [{"student_id": 101}]
+                elif self.table_name == "student_biometrics":
+                    # Verification check returns None (row safely removed)
+                    res.data = None
+                return res
+
+        class MockClient:
+            def table(self, name):
+                return MockQuery(name)
+
+        import streamlit as st
+        st.session_state["user_id"] = "auth-101"
+        success, err = delete_student_biometrics(MockClient(), student_id=101)
+        self.assertTrue(success)
+        self.assertIsNone(err)
+
+    def test_delete_biometrics_verification_failure(self):
+        """If database record persists after delete (e.g. RLS blocked deletion), must report failure."""
+        class MockQuery:
+            def __init__(self, table_name):
+                self.table_name = table_name
+            def select(self, *a, **kw):
+                return self
+            def eq(self, *a, **kw):
+                return self
+            def limit(self, *a, **kw):
+                return self
+            def maybe_single(self):
+                return self
+            def delete(self):
+                return self
+            def execute(self):
+                class Res:
+                    pass
+                res = Res()
+                if self.table_name == "students":
+                    res.data = [{"student_id": 101}]
+                elif self.table_name == "student_biometrics":
+                    # Record is still present!
+                    res.data = {"student_id": 101, "face_embedding": [0.1]}
+                return res
+
+        class MockClient:
+            def table(self, name):
+                return MockQuery(name)
+
+        import streamlit as st
+        st.session_state["user_id"] = "auth-101"
+        success, err = delete_student_biometrics(MockClient(), student_id=101)
+        self.assertFalse(success)
+        self.assertIn("still present", err)
+
+    def test_delete_biometrics_database_exception(self):
+        """If database throws an error during delete, it must be caught and reported safely."""
+        class MockQuery:
+            def __init__(self, table_name):
+                self.table_name = table_name
+            def select(self, *a, **kw):
+                return self
+            def eq(self, *a, **kw):
+                return self
+            def limit(self, *a, **kw):
+                return self
+            def maybe_single(self):
+                return self
+            def delete(self):
+                raise RuntimeError("PostgREST connection failed")
+            def execute(self):
+                class Res:
+                    pass
+                res = Res()
+                if self.table_name == "students":
+                    res.data = [{"student_id": 101}]
+                return res
+
+        class MockClient:
+            def table(self, name):
+                return MockQuery(name)
+
+        import streamlit as st
+        st.session_state["user_id"] = "auth-101"
+        success, err = delete_student_biometrics(MockClient(), student_id=101)
+        self.assertFalse(success)
+        self.assertIn("Database error during profile deletion", err)
+
+    def test_delete_biometrics_unverified_student_blocked(self):
+        """Unverified student should not be able to trigger biometric deletion."""
+        class MockTable:
+            def select(self, *a, **kw):
+                return self
+            def eq(self, *a, **kw):
+                return self
+            def limit(self, *a, **kw):
+                return self
+            def execute(self):
+                class Res:
+                    data = []
+                return Res()
+
+        class MockClient:
+            def table(self, name):
+                return MockTable()
+
+        import streamlit as st
+        st.session_state["user_id"] = "different-auth-id"
+        success, err = delete_student_biometrics(MockClient(), student_id=999)
+        self.assertFalse(success)
+        self.assertIn("Cannot verify student identity", err)
 
 
 if __name__ == "__main__":

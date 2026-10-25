@@ -5,6 +5,12 @@ Extracts normalized speaker embeddings from spoken audio samples.
 Supports Resemblyzer (256-d deep learning) when available, and provides a
 lightweight, calibrated spectral-temporal acoustic embedding (128-d) via SciPy
 for resource-constrained environments (such as Streamlit Community Cloud).
+
+IMPORTANT LIMITATION NOTE:
+The SciPy spectral-temporal fallback extracts acoustic frequency power distributions
+and spectral characteristics. It is not an identity-grade speaker discriminator and
+cannot reliably differentiate individual human speakers. For reliable speaker verification,
+deep-learning models (e.g. Resemblyzer) with clean audio captures are required.
 """
 
 from typing import Tuple, Optional, List

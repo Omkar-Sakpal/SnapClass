@@ -7,6 +7,7 @@ identity checks against authenticated Supabase Auth, and profile deletion.
 """
 
 from datetime import datetime, timezone
+from typing import Tuple, Optional
 import streamlit as st
 from supabase import Client
 
@@ -53,6 +54,37 @@ def load_student_biometrics(client: Client, student_id: int):
         return None
 
 
+def delete_student_biometrics(client: Client, student_id: int) -> Tuple[bool, Optional[str]]:
+    """
+    Revokes consent and deletes the student's biometric record from public.student_biometrics.
+    Verifies that the record is truly removed from the database before returning.
+
+    Returns:
+        (success: bool, error_message: Optional[str])
+    """
+    if not _verify_authenticated_student(client, student_id):
+        return False, "Authentication security error: Cannot verify student identity."
+
+    try:
+        # 1. Execute delete operation under authenticated student RLS
+        client.table("student_biometrics").delete().eq("student_id", student_id).execute()
+
+        # 2. Verify that the record is truly absent
+        check = (
+            client.table("student_biometrics")
+            .select("student_id")
+            .eq("student_id", student_id)
+            .maybe_single()
+            .execute()
+        )
+        if check and check.data:
+            return False, "Deletion could not be verified; the biometric profile is still present in the database."
+
+        return True, None
+    except Exception as exc:
+        return False, f"Database error during profile deletion: {type(exc).__name__}: {str(exc)}"
+
+
 def render_student_biometrics_section(client: Client, student_id: int) -> None:
     """
     Renders the Biometric Registration section on the student dashboard.
@@ -89,7 +121,7 @@ def render_student_biometrics_section(client: Client, student_id: int) -> None:
             st.info("⚪ Voice Profile: Not registered")
     with col3:
         if has_consent:
-            ts = bio_record.get("consent_timestamp", "")[:19].replace("T", " ")
+            ts = str(bio_record.get("consent_timestamp", ""))[:19].replace("T", " ")
             st.success(f"🟢 Consent: Active ({ts} UTC)")
         else:
             st.warning("⚪ Consent: Not provided")
@@ -100,12 +132,12 @@ def render_student_biometrics_section(client: Client, student_id: int) -> None:
     with st.expander("📋 Biometric Privacy, Purpose & Retention Notice", expanded=not (has_face and has_voice)):
         st.markdown(
             """
-            **How SnapClass uses your biometric data:**
-            - **Mathematical Templates Only:** Your facial features and voice characteristics are converted into **numerical mathematical vectors** (128 numbers each).
-            - **No Raw Media Storage:** Your raw webcam snapshots and voice audio recordings are processed in memory and **immediately discarded**. They are never saved to disk or Supabase storage.
-            - **Purpose:** Exclusively used for classroom attendance verification by teachers of subjects you are actively enrolled in.
-            - **Voluntary & Alternative:** Biometric attendance is voluntary. **Manual attendance by the teacher remains fully supported** for all classes.
-            - **Right to Erasure:** You can delete your biometric profile at any time below, which permanently purges your templates from the database.
+            **How SnapClass handles biometric data:**
+            - **Mathematical Descriptors Only:** Your webcam snapshot and audio recording are processed by the application to compute numerical embedding vectors (128 numbers for face, normalized embedding for voice). Only these mathematical vectors and consent timestamps are stored in the database.
+            - **No Raw Media in Database:** Raw photos and voice recordings are not stored in the database or Supabase storage buckets.
+            - **Attendance Purpose Only:** Biometric data is used solely for classroom attendance verification for subjects in which you are enrolled.
+            - **Voluntary Participation:** Biometric registration is completely optional. **Manual attendance by the teacher is always supported** as a standard alternative.
+            - **Explicit Revocation:** You can revoke consent and delete your biometric descriptors at any time using the Manage / Delete Profile tab below.
             """
         )
 
@@ -115,20 +147,29 @@ def render_student_biometrics_section(client: Client, student_id: int) -> None:
             key="student_biometric_consent_checkbox",
         )
 
-    if not consent_checked:
+    # Explicit handling of unchecking consent when a profile already exists
+    if has_consent and not consent_checked:
+        st.warning(
+            "⚠️ **Note on Consent & Existing Templates:** You currently have an active biometric profile on file. "
+            "Unchecking the box above prevents registering new templates, but does NOT revoke previously granted consent "
+            "or delete your stored mathematical templates. To permanently revoke consent and delete your templates, "
+            "use the explicit **Revoke Consent & Delete Biometrics** flow in the Manage / Delete tab below."
+        )
+    elif not consent_checked:
         st.info("👉 Check the consent box above to unlock face and voice registration.")
-        if bio_record:
-            st.caption("Unchecking consent will prevent updating biometrics until re-confirmed.")
         st.divider()
 
-    # 5. Registration Tabs (Only active when consent is checked)
+    # 5. Registration Tabs
     tab_face, tab_voice, tab_manage = st.tabs(
         ["📸 Face Registration", "🎙️ Voice Registration", "⚙️ Manage / Delete Profile"]
     )
 
     with tab_face:
         st.markdown("##### Facial Profile Registration")
-        st.write("Ensure your room is well-lit, look straight into the camera, and capture a single clear photo.")
+        st.write(
+            "Captures a frontal webcam snapshot to extract a 128-dimensional facial descriptor using dlib ResNet. "
+            "Ensure adequate frontal lighting, look straight into the camera, and ensure only one person is in frame."
+        )
 
         if not consent_checked:
             st.warning("Please check the consent agreement above before capturing your face.")
@@ -155,15 +196,24 @@ def render_student_biometrics_section(client: Client, student_id: int) -> None:
                         if bio_record and bio_record.get("voice_embedding"):
                             update_payload["voice_embedding"] = bio_record["voice_embedding"]
 
-                        client.table("student_biometrics").upsert(update_payload).execute()
-                        st.success("✅ Face profile registered successfully!")
-                        st.balloons()
-                        st.rerun()
+                        res = client.table("student_biometrics").upsert(update_payload).execute()
+                        if res and res.data:
+                            st.success("✅ Face profile registered successfully!")
+                            st.balloons()
+                            st.rerun()
+                        else:
+                            st.error("Failed to verify that the face profile was saved. Please try again.")
                     except Exception as e:
                         st.error(f"Failed to save face profile to database: {type(e).__name__}: {e}")
 
     with tab_voice:
         st.markdown("##### Voice Profile Registration")
+        st.warning(
+            "⚠️ **Experimental Acoustic Fallback Notice:**\n\n"
+            "On cloud environments without GPU acceleration, voice feature extraction uses a lightweight SciPy spectral fallback. "
+            "This extracts acoustic frequency and energy distributions, but **is not suitable for reliable individual speaker identification**. "
+            "Biometric attendance must always be reviewed and confirmed by the teacher."
+        )
         student_display_name = st.session_state.get("display_name", "Student")
         st.info(f"**Standard enrollment phrase:** Please read aloud clearly:\n\n> *\"I am present, my name is {student_display_name}.\"*")
 
@@ -191,39 +241,47 @@ def render_student_biometrics_section(client: Client, student_id: int) -> None:
                         if bio_record and bio_record.get("face_embedding"):
                             update_payload["face_embedding"] = bio_record["face_embedding"]
 
-                        client.table("student_biometrics").upsert(update_payload).execute()
-                        st.success("✅ Voice profile registered successfully!")
-                        st.balloons()
-                        st.rerun()
+                        res = client.table("student_biometrics").upsert(update_payload).execute()
+                        if res and res.data:
+                            st.success("✅ Voice profile registered successfully!")
+                            st.balloons()
+                            st.rerun()
+                        else:
+                            st.error("Failed to verify that the voice profile was saved. Please try again.")
                     except Exception as e:
                         st.error(f"Failed to save voice profile to database: {type(e).__name__}: {e}")
 
     with tab_manage:
         st.markdown("##### Profile Management & Revocation")
         st.write(
-            "You may delete your biometric profile at any time. "
-            "Deleting your profile immediately purges all mathematical templates and consent timestamps from Supabase."
+            "You may revoke consent and delete your biometric profile at any time. "
+            "Deleting your profile permanently removes all mathematical templates and consent timestamps from Supabase."
         )
 
         if not bio_record:
             st.caption("No biometric profile is currently on file for your account.")
         else:
             with st.container(border=True):
-                st.markdown("⚠️ **Danger Zone: Revoke Consent & Delete Biometrics**")
+                st.markdown("⚠️ **Revoke Consent & Delete Biometric Profile**")
                 st.write(
-                    "This action will permanently delete your facial and voice embeddings. "
-                    "Your general student account, class enrollments, and past attendance records remain unaffected."
+                    "This action permanently revokes your biometric consent and deletes your stored facial and "
+                    "voice mathematical descriptors. Your student account, subject enrollments, and past attendance records are unaffected."
                 )
-                confirm_delete = st.button("🗑️ Delete My Biometric Profile", type="primary", key="btn_delete_biometrics")
 
-                if confirm_delete:
-                    try:
-                        client.table("student_biometrics").delete().eq("student_id", student_id).execute()
-                        # Invalidate in-memory session biometrics
+                confirm_revoke = st.checkbox(
+                    "I confirm that I want to revoke my consent and permanently delete my stored biometric templates.",
+                    key="confirm_revoke_biometrics_checkbox",
+                )
+
+                if st.button("🗑️ Permanently Delete Biometric Profile", type="primary", disabled=not confirm_revoke, key="btn_delete_biometrics"):
+                    with st.spinner("Deleting biometric profile and verifying database removal..."):
+                        success, err = delete_student_biometrics(client, student_id)
+
+                    if success:
                         st.session_state.pop("cached_biometrics", None)
-                        st.success("Your biometric profile has been permanently deleted from SnapClass.")
+                        st.success("✅ Your biometric profile and consent records have been permanently deleted.")
                         st.rerun()
-                    except Exception as e:
-                        st.error(f"Could not delete biometric profile: {type(e).__name__}: {e}")
+                    else:
+                        st.error(f"❌ Deletion failed: {err}")
 
     st.divider()
