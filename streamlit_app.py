@@ -2,6 +2,7 @@ import streamlit as st
 import pandas as pd
 from supabase import create_client, Client
 from datetime import datetime, timezone, date, time
+from src.components.student_biometrics_ui import render_student_biometrics_section
 
 st.set_page_config(
     page_title="SnapClass | Attendance",
@@ -391,48 +392,55 @@ def student_dashboard(client: Client) -> None:
                         st.rerun()
             except Exception as e:
                 st.error(f"Could not join subject: {type(e).__name__}: {e}")
-    st.subheader("My attendance")
     student_id = st.session_state.get("profile_id")
     if student_id is None:
         st.error("Your student profile ID is missing. Sign out and sign in again.")
         return
-    try:
-        rows = (
-            client.table("attendance_logs").select("subject_id,timestamp,is_present")
-            .eq("student_id", student_id).order("timestamp", desc=True).execute().data
-        )
-        if not rows:
-            st.info(
-                "No attendance records were returned for your student profile. "
-                "If a teacher has marked attendance, check the attendance_logs "
-                "SELECT policy and confirm that your student_id matches the record in Supabase."
+
+    tab_att, tab_bio = st.tabs(["📊 My Attendance", "🧬 Biometric Registration"])
+
+    with tab_att:
+        st.subheader("My attendance")
+        try:
+            rows = (
+                client.table("attendance_logs").select("subject_id,timestamp,is_present")
+                .eq("student_id", student_id).order("timestamp", desc=True).execute().data
             )
-            return
-        subject_ids = sorted({row["subject_id"] for row in rows})
-        subjects = (
-            client.table("subjects").select("subject_id,name,subject_code")
-            .in_("subject_id", subject_ids).execute().data
-        )
-        subject_names = {
-            s["subject_id"]: f'{s["name"]} ({s["subject_code"]})' for s in subjects
-        }
-        df = pd.DataFrame(rows)
-        df["subject"] = df["subject_id"].map(subject_names).fillna(
-            df["subject_id"].map(lambda value: f"Subject {value}")
-        )
-        df["status"] = df["is_present"].map({True: "Present", False: "Absent"}).fillna("Unknown")
-        df["timestamp"] = pd.to_datetime(df["timestamp"], errors="coerce", utc=True)
-        df["timestamp"] = df["timestamp"].dt.strftime("%Y-%m-%d %H:%M:%S UTC")
-        st.dataframe(df[["subject", "timestamp", "status"]], use_container_width=True, hide_index=True)
-        total = len(rows)
-        present = sum(row.get("is_present") is True for row in rows)
-        st.metric("Attendance rate", f"{present / total:.0%}" if total else "—")
-    except Exception as e:
-        st.error("Could not load attendance from Supabase. " f"Error: {type(e).__name__}: {e}")
-        st.caption(
-            "If the error mentions permission denied, inspect the SELECT RLS policies "
-            "on attendance_logs and subjects. Do not disable RLS or use a service-role key in the app."
-        )
+            if not rows:
+                st.info(
+                    "No attendance records were returned for your student profile. "
+                    "If a teacher has marked attendance, check the attendance_logs "
+                    "SELECT policy and confirm that your student_id matches the record in Supabase."
+                )
+            else:
+                subject_ids = sorted({row["subject_id"] for row in rows})
+                subjects = (
+                    client.table("subjects").select("subject_id,name,subject_code")
+                    .in_("subject_id", subject_ids).execute().data
+                )
+                subject_names = {
+                    s["subject_id"]: f'{s["name"]} ({s["subject_code"]})' for s in subjects
+                }
+                df = pd.DataFrame(rows)
+                df["subject"] = df["subject_id"].map(subject_names).fillna(
+                    df["subject_id"].map(lambda value: f"Subject {value}")
+                )
+                df["status"] = df["is_present"].map({True: "Present", False: "Absent"}).fillna("Unknown")
+                df["timestamp"] = pd.to_datetime(df["timestamp"], errors="coerce", utc=True)
+                df["timestamp"] = df["timestamp"].dt.strftime("%Y-%m-%d %H:%M:%S UTC")
+                st.dataframe(df[["subject", "timestamp", "status"]], use_container_width=True, hide_index=True)
+                total = len(rows)
+                present = sum(row.get("is_present") is True for row in rows)
+                st.metric("Attendance rate", f"{present / total:.0%}" if total else "—")
+        except Exception as e:
+            st.error("Could not load attendance from Supabase. " f"Error: {type(e).__name__}: {e}")
+            st.caption(
+                "If the error mentions permission denied, inspect the SELECT RLS policies "
+                "on attendance_logs and subjects. Do not disable RLS or use a service-role key in the app."
+            )
+
+    with tab_bio:
+        render_student_biometrics_section(client, student_id)
 
 
 def landing_page() -> None:
