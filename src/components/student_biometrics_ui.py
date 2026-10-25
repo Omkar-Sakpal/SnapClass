@@ -48,9 +48,9 @@ def load_student_biometrics(client: Client, student_id: int):
             .maybe_single()
             .execute()
         )
-        return res.data
+        return res.data if res else None
     except Exception as exc:
-        st.warning(f"Could not load biometric status: {type(exc).__name__}: {exc}")
+        st.warning(f"Could not load biometric status: {type(exc).__name__}: {exc}. Manual attendance remains available.")
         return None
 
 
@@ -171,40 +171,46 @@ def render_student_biometrics_section(client: Client, student_id: int) -> None:
             "Ensure adequate frontal lighting, look straight into the camera, and ensure only one person is in frame."
         )
 
+        if st.session_state.pop("face_registration_success", None):
+            st.success("✅ Face profile registered successfully!")
+            st.balloons()
+
         if not consent_checked:
             st.warning("Please check the consent agreement above before capturing your face.")
         else:
             face_cam = st.camera_input("Capture face snapshot", key="face_registration_camera")
             if face_cam is not None:
-                with st.spinner("Analyzing facial features and extracting 128-d descriptor..."):
-                    embedding, error = extract_face_embedding(face_cam)
+                if st.button("Register Face Profile", type="primary", key="btn_register_face"):
+                    with st.spinner("Analyzing facial features and extracting 128-d descriptor..."):
+                        embedding, error = extract_face_embedding(face_cam)
 
-                if error:
-                    st.error(f"❌ {error}")
-                elif embedding:
-                    now_utc = datetime.now(timezone.utc).isoformat()
-                    try:
-                        # Prepare row with consent guarantees enforced
-                        update_payload = {
-                            "student_id": student_id,
-                            "face_embedding": embedding,
-                            "consent_given": True,
-                            "consent_timestamp": now_utc,
-                            "updated_at": now_utc,
-                        }
-                        # If existing record had voice, preserve it
-                        if bio_record and bio_record.get("voice_embedding"):
-                            update_payload["voice_embedding"] = bio_record["voice_embedding"]
+                    if error:
+                        st.error(f"❌ {error}")
+                    elif embedding:
+                        now_utc = datetime.now(timezone.utc).isoformat()
+                        try:
+                            # Prepare row with consent guarantees enforced
+                            update_payload = {
+                                "student_id": student_id,
+                                "face_embedding": embedding,
+                                "consent_given": True,
+                                "consent_timestamp": now_utc,
+                                "updated_at": now_utc,
+                            }
+                            # If existing record had voice, preserve it
+                            if bio_record and bio_record.get("voice_embedding"):
+                                update_payload["voice_embedding"] = bio_record["voice_embedding"]
 
-                        res = client.table("student_biometrics").upsert(update_payload).execute()
-                        if res and res.data:
-                            st.success("✅ Face profile registered successfully!")
-                            st.balloons()
-                            st.rerun()
-                        else:
-                            st.error("Failed to verify that the face profile was saved. Please try again.")
-                    except Exception as e:
-                        st.error(f"Failed to save face profile to database: {type(e).__name__}: {e}")
+                            res = client.table("student_biometrics").upsert(update_payload).execute()
+                            if res and res.data:
+                                st.session_state["face_registration_success"] = True
+                                st.success("✅ Face profile registered successfully!")
+                                st.balloons()
+                                st.rerun()
+                            else:
+                                st.error("Failed to verify that the face profile was saved. Please try again.")
+                        except Exception as e:
+                            st.error(f"Failed to save face profile to database: {type(e).__name__}: {e}")
 
     with tab_voice:
         st.markdown("##### Voice Profile Registration")
@@ -217,39 +223,45 @@ def render_student_biometrics_section(client: Client, student_id: int) -> None:
         student_display_name = st.session_state.get("display_name", "Student")
         st.info(f"**Standard enrollment phrase:** Please read aloud clearly:\n\n> *\"I am present, my name is {student_display_name}.\"*")
 
+        if st.session_state.pop("voice_registration_success", None):
+            st.success("✅ Voice profile registered successfully!")
+            st.balloons()
+
         if not consent_checked:
             st.warning("Please check the consent agreement above before recording your voice.")
         else:
             voice_audio = st.audio_input("Record your voice phrase", key="voice_registration_audio")
             if voice_audio is not None:
-                with st.spinner("Analyzing vocal frequencies and extracting speaker embedding..."):
-                    embedding, error = extract_voice_embedding(voice_audio)
+                if st.button("Register Voice Profile", type="primary", key="btn_register_voice"):
+                    with st.spinner("Analyzing vocal frequencies and extracting speaker embedding..."):
+                        embedding, error = extract_voice_embedding(voice_audio)
 
-                if error:
-                    st.error(f"❌ {error}")
-                elif embedding:
-                    now_utc = datetime.now(timezone.utc).isoformat()
-                    try:
-                        update_payload = {
-                            "student_id": student_id,
-                            "voice_embedding": embedding,
-                            "consent_given": True,
-                            "consent_timestamp": now_utc,
-                            "updated_at": now_utc,
-                        }
-                        # If existing record had face, preserve it
-                        if bio_record and bio_record.get("face_embedding"):
-                            update_payload["face_embedding"] = bio_record["face_embedding"]
+                    if error:
+                        st.error(f"❌ {error}")
+                    elif embedding:
+                        now_utc = datetime.now(timezone.utc).isoformat()
+                        try:
+                            update_payload = {
+                                "student_id": student_id,
+                                "voice_embedding": embedding,
+                                "consent_given": True,
+                                "consent_timestamp": now_utc,
+                                "updated_at": now_utc,
+                            }
+                            # If existing record had face, preserve it
+                            if bio_record and bio_record.get("face_embedding"):
+                                update_payload["face_embedding"] = bio_record["face_embedding"]
 
-                        res = client.table("student_biometrics").upsert(update_payload).execute()
-                        if res and res.data:
-                            st.success("✅ Voice profile registered successfully!")
-                            st.balloons()
-                            st.rerun()
-                        else:
-                            st.error("Failed to verify that the voice profile was saved. Please try again.")
-                    except Exception as e:
-                        st.error(f"Failed to save voice profile to database: {type(e).__name__}: {e}")
+                            res = client.table("student_biometrics").upsert(update_payload).execute()
+                            if res and res.data:
+                                st.session_state["voice_registration_success"] = True
+                                st.success("✅ Voice profile registered successfully!")
+                                st.balloons()
+                                st.rerun()
+                            else:
+                                st.error("Failed to verify that the voice profile was saved. Please try again.")
+                        except Exception as e:
+                            st.error(f"Failed to save voice profile to database: {type(e).__name__}: {e}")
 
     with tab_manage:
         st.markdown("##### Profile Management & Revocation")
