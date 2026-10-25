@@ -11,11 +11,30 @@ from typing import Tuple, Optional
 import streamlit as st
 from supabase import Client
 
-from src.ai.face_engine import (
-    extract_face_embedding,
-    is_sface_profile,
-    is_legacy_profile,
-)
+try:
+    from src.ai.face_engine import (
+        extract_face_embedding,
+        is_sface_profile,
+        is_legacy_profile,
+    )
+except ImportError:
+    from src.ai.face_engine import extract_face_embedding
+
+    def is_sface_profile(bio_face):
+        """Fallback check for OpenCV SFace profile format if face_engine is an older cached version."""
+        if not isinstance(bio_face, dict):
+            return False
+        return (
+            bio_face.get("engine") == "opencv_sface"
+            and isinstance(bio_face.get("embedding"), list)
+            and len(bio_face.get("embedding")) == 128
+        )
+
+    def is_legacy_profile(bio_face):
+        """Fallback check for legacy biometric profile."""
+        if bio_face is None:
+            return False
+        return not is_sface_profile(bio_face)
 from src.ai.voice_engine import extract_voice_embedding
 
 
