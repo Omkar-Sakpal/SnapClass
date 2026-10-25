@@ -7,7 +7,3 @@ scipy>=1.11,<2
 scikit-learn>=1.3,<2
 pillow>=10.2,<12
 opencv-python-headless>=4.8,<5
-dlib-bin>=19.24.2; sys_platform == 'win32'
-dlib>=19.24; sys_platform != 'win32'
-setuptools<70.0.0
-git+https://github.com/ageitgey/face_recognition_models

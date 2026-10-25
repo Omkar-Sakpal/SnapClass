@@ -62,6 +62,7 @@ def create_synthetic_wav(duration=1.5, sr=16000, silent=False) -> bytes:
 
 
 class TestFaceEngine(unittest.TestCase):
+    @unittest.skipUnless(get_dlib_models()["available"], "dlib models unavailable on this host")
     def test_dlib_models_available(self):
         models = get_dlib_models()
         self.assertTrue(models["available"], f"dlib models failed to load: {models['error']}")
@@ -69,6 +70,7 @@ class TestFaceEngine(unittest.TestCase):
         self.assertIsNotNone(models["shape_predictor"])
         self.assertIsNotNone(models["face_encoder"])
 
+    @unittest.skipUnless(get_dlib_models()["available"], "dlib models unavailable on this host")
     def test_extract_face_embedding_success(self):
         img = create_synthetic_face(has_face=True)
         emb, err = extract_face_embedding(img)
